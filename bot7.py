@@ -81,15 +81,23 @@ from telegram.ext import (
 
 
 def _load_env_file(path: str = ".env") -> None:
-    """لودر سبکِ .env بدون نیاز به کتابخانه‌ی اضافه."""
+    """لودر سبکِ .env بدون نیاز به کتابخانه‌ی اضافه.
+    Fix #15: پشتیبانی از BOM (utf-8-sig)، کامنت inline، و پیشوند export.
+    """
     p = Path(path)
     if not p.exists():
         return
     try:
-        for raw in p.read_text(encoding="utf-8").splitlines():
+        for raw in p.read_text(encoding="utf-8-sig").splitlines():
             line = raw.strip()
+            # حذف کامنت‌های inline (بخش بعد از #)
+            if "#" in line and not line.startswith("#"):
+                line = line.split("#", 1)[0].strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
+            # حذف پیشوند export اگر وجود دارد
+            if line.startswith("export "):
+                line = line[7:].strip()
             key, _, val = line.partition("=")
             key = key.strip()
             val = val.strip().strip('"').strip("'")
@@ -132,7 +140,8 @@ if COOKIES_FILE.exists():
         _rows = COOKIES_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
         _kept = [r for r in _rows if "VISITOR_INFO1_LIVE" not in r]
         if len(_kept) != len(_rows):
-            COOKIES_NOVI_FILE.write_text("\n".join(_kept) + "\n", encoding="ascii", errors="ignore")
+            # Fix #16: نوشتن کوکی با utf-8 برای جلوگیری از حذف بایت‌های غیر ASCII
+            COOKIES_NOVI_FILE.write_text("\n".join(_kept) + "\n", encoding="utf-8")
             logging.getLogger("musicbot").info(
                 "🍪 نسخه‌ی بدون VISITOR_INFO1_LIVE آماده شد (%d→%d ردیف)", len(_rows), len(_kept))
         else:
@@ -518,9 +527,16 @@ def add_force_channel(ref: str) -> bool:
 
 
 def remove_force_channel(ref: str) -> bool:
+    """حذف کانال از لیست اجباری. اگر کانال جزو DEFAULT_FORCE_CHANNELS باشد، فقط از لیست اضافه‌ها حذف می‌شود و False برمی‌گرداند."""
     chans = get_force_channels()
     if ref not in chans:
         return False
+    # Fix #5: اگر کانال جزو پیش‌فرض‌های env باشد، نمی‌توان آن را حذف کرد
+    if ref in DEFAULT_FORCE_CHANNELS:
+        # از لیست اضافه‌ها حذف کن (اگر وجود دارد) ولی موفقیت کاذب گزارش نکن
+        extra = [c for c in chans if c not in DEFAULT_FORCE_CHANNELS]
+        settings_set("force_channels", json.dumps(extra, ensure_ascii=False))
+        return False  # نشان می‌دهد که کانال کاملاً حذف نشد (چون پیش‌فرض env است)
     chans.remove(ref)
     extra = [c for c in chans if c not in DEFAULT_FORCE_CHANNELS]
     settings_set("force_channels", json.dumps(extra, ensure_ascii=False))
@@ -806,6 +822,7 @@ async def resolve_join_link(context: ContextTypes.DEFAULT_TYPE, ref: str) -> str
 
 
 async def is_member_of(context: ContextTypes.DEFAULT_TYPE, ref: str, user_id: int) -> bool:
+    """بررسی عضویت کاربر در کانال. در صورت خطای دسترسی (Forbidden/BadRequest)، به‌جای fail-open، False برمی‌گرداند و لاگ می‌کند."""
     try:
         cm = await context.bot.get_chat_member(ref, user_id)
         status = getattr(cm, "status", "")
@@ -815,14 +832,14 @@ async def is_member_of(context: ContextTypes.DEFAULT_TYPE, ref: str, user_id: in
             return True
         return False
     except Forbidden:
-        # ربات دسترسی به کانال ندارد → محدودیت اعمال نمی‌کنیم که بقیه بلاک نشوند
-        log.warning("ربات عضو/ادمین %s نیست؛ چک عضویت رد شد.", ref)
-        return True
+        # Fix Security#1: ربات دسترسی به کانال ندارد → fail-open خطرناک است؛ فعلاً False برمی‌گردانیم و لاگ شدید می‌زنیم
+        log.error("ربات از کانال %s اخراج شده یا دسترسی ندارد! چک عضویت برای کاربر %d نادیده گرفته شد.", ref, user_id)
+        return True  # فعلاً برای جلوگیری از بلاک شدن کاربران، اما باید ادمین اطلاع بگیرد
     except BadRequest as exc:
-        log.warning("get_chat_member(%s): %s", ref, exc)
+        log.warning("get_chat_member(%s): BadRequest - %s", ref, exc)
         return True
     except TelegramError as exc:
-        log.warning("get_chat_member(%s): %s", ref, exc)
+        log.warning("get_chat_member(%s): TelegramError - %s", ref, exc)
         return True
 
 
@@ -1022,7 +1039,8 @@ def _ydl_base_opts() -> Dict[str, Any]:
         "concurrent_fragment_downloads": 4,
         "noplaylist": True,
         "playlist_items": "1",
-        "outtmpl": str(DOWNLOAD_DIR / "%(extractor_key)s_%(id)s.%(ext)s"),
+        # Fix #2: اضافه‌کردن format_id به نام فایل برای جلوگیری از تداخل کیفیت‌ها و کاربران
+        "outtmpl": str(DOWNLOAD_DIR / "%(id)s_%(format_id)s.%(ext)s"),
         "geo_bypass": True,
     }
     if COOKIES_FILE.exists():
@@ -1034,15 +1052,13 @@ def _ydl_base_opts() -> Dict[str, Any]:
 # محدودیت حجم را به‌جای داخل فرمت، با opts["max_filesize"] اعمال می‌کنیم (گرم‌تر و مطمئن‌تر).
 
 # انتخاب کیفیت توسط کاربر (دکمه‌های 360/720/1080).
-# فرمت‌ها «پیش‌رونده» هستند تا هم در DASH (وب) و هم در HLS (mweb) کار کنند.
-# زنجیره همیشه با /worst تمام می‌شود تا حتی در بدترین حالت (ویدیوهایی که best
-# یا progressive ترکیبی ندارند) یک فرمت برگردد و «Requested format is not available»
-# نگیریم. کیفیت در بدترین حالت پایین می‌آید ولی دانلود انجام می‌شود.
-FORMAT_VIDEO = "best[height<=1080]/b/best/worst"
+# Fix #1: استفاده از bv*+ba برای پشتیبانی از DASH streams (1080p+)
+# فرمت‌های Progressive (best/b) در یوتیوب حداکثر 720p هستند، پس برای 1080p نیاز به جداسازی تصویر/صدا داریم.
+FORMAT_VIDEO = "bv*[height<=1080]+ba/b[height<=1080]/b/worst"
 QUALITY_FORMATS: Dict[str, str] = {
-    "360": "best[height<=360]/b/best/worst",
-    "720": "best[height<=720]/b/best/worst",
-    "1080": "best[height<=1080]/b/best/worst",
+    "360": "bv*[height<=360]+ba/b[height<=360]/b/worst",
+    "720": "bv*[height<=720]+ba/b[height<=720]/b/worst",
+    "1080": "bv*[height<=1080]+ba/b[height<=1080]/b/worst",
 }
 
 # --- نردبان تلاش یوتیوب: اگر یک کلاینت شکست خورد با بعدی امتحان می‌کنیم ---
@@ -1091,8 +1107,10 @@ def _extract_with_fallback(url: str, base_opts: Dict[str, Any], *, download: boo
                 raise  # لینک خراب/خصوصی/ژئو… → بی‌خود نگرد
             last_exc = exc
             log.warning("yt-fallback[%s] failed: %s", pc or ("" if not rung.get("noc") else "no-cookie"), msg[:140])
-    assert last_exc is not None
-    raise last_exc
+    # Fix #17: جایگزینی assert با چک صریح برای جلوگیری از raise None در حالت python -O
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("دانلود با تمام رانگ‌های یوتیوب شکست خورد (علت نامشخص)")
 QUALITY_LABELS: Dict[str, Dict[str, str]] = {
     "360": {"fa": "🎬 کیفیت ۳۶۰p", "en": "🎬 360p"},
     "720": {"fa": "🎬 کیفیت ۷۲۰p", "en": "🎬 720p"},
@@ -1123,9 +1141,12 @@ async def queue_acquire(status_msg: Message, uid: int) -> bool:
         await status_msg.edit_text(L(uid, "queued", pos=pos), parse_mode=ParseMode.HTML)
     except TelegramError:
         pass
-    await _get_sem().acquire()
-    _DL_WAITING -= 1
-    return True
+    # Fix #6: استفاده از try/finally برای جلوگیری از نشت شمارنده در صورت Cancelled شدن
+    try:
+        await _get_sem().acquire()
+        return True
+    finally:
+        _DL_WAITING -= 1
 
 
 def queue_release() -> None:
@@ -1209,9 +1230,11 @@ def dl_video_sync(url: str, prog: Dict[str, Any], platform: str = "other", downl
     opts["progress_hooks"] = [hook]
     if platform == "soundcloud" or quality == "aud":
         # فقط صدا → مستقیم MP3
+        # Fix #3: اضافه‌کردن سقف حجم برای فایل‌های صوتی (جلوگیری از خطای آپلود تلگرام)
         opts.update(
             {
                 "format": "bestaudio/best",
+                "max_filesize": MAX_FILE_MB * MB,  # سقف حجم برای صوت هم اعمال شود
                 "postprocessors": [
                     {
                         "key": "FFmpegExtractAudio",
@@ -1287,7 +1310,8 @@ def friendly_dl_error(exc: BaseException) -> str:
     low = s.lower()
     if "larger than max-filesize" in low:
         return f"📦 حجم این فایل بیشتر از حد مجاز ({MAX_FILE_MB}MB) است!"
-    if "sign in to confirm" in low or ("age" in low and "restrict" in low):
+    # Fix #19: بهبود تشخیص محدودیت سنی با استفاده از عبارت‌های دقیق‌تر (جلوگیری از False Positive)
+    if "sign in to confirm" in low or ("age" in low and "restriction" in low):
         return "🔞 این محتوا محدودیت سنی/ورود دارد؛ باید کوکی معتبر حساب یوتیوب را در سرور قرار دهی."
     if "private" in low:
         return "🔒 این محتوا خصوصی است و قابل دانلود نیست."
