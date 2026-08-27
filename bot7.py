@@ -42,7 +42,7 @@ import sqlite3
 import threading
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -148,6 +148,7 @@ MAX_FILE_MB: int = int(os.getenv("MAX_FILE_MB", "48"))          # سقف ارس�
 BOT_DL_MB: int = 20                                              # سقف دانلود ربات از فایل‌های تلگرام (API)
 AUDIO_BITRATE: str = os.getenv("AUDIO_BITRATE", "192")           # کیفیت mp3 خروجی
 CLEAN_AFTER_MIN: int = int(os.getenv("CLEAN_AFTER_MIN", "45"))   # عمر فایل‌ها قبل از پاکسازی
+HISTORY_KEEP_DAYS: int = int(os.getenv("HISTORY_KEEP_DAYS", "7"))  # نگهداری تاریخچه به مدت روز
 JOIN_CACHE_SEC: int = int(os.getenv("JOIN_CACHE_SEC", "600"))    # کش نتیجه‌ی عضویت
 COOLDOWN_SEC: int = int(os.getenv("COOLDOWN_SEC", "12"))         # فاصله‌ی بین درخواست هر کاربر
 SHAZAM_SNIPPET_SEC: int = int(os.getenv("SHAZAM_SNIPPET_SEC", "95"))  # چند ثانیه صدا برای شزام
@@ -1063,12 +1064,15 @@ _YT_TRANSIENT_RE = re.compile(
     r"requested format|unable to extract player", re.I)
 
 
-def _extract_with_fallback(url: str, base_opts: Dict[str, Any], *, download: bool = True) -> Any:
+def _extract_with_fallback(url: str, base_opts: Dict[str, Any], *, download: bool = True, platform: str = "other") -> Any:
     """extract_info با نردبان کلاینت‌ها؛ خطاهای گذرا → رانگ بعدی، بقیه → raise فوری."""
     had_cookies = "cookiefile" in base_opts
     novi_ready = COOKIES_NOVI_FILE != COOKIES_FILE and COOKIES_NOVI_FILE.exists()
     last_exc: Optional[Exception] = None
-    for rung in _YT_FB_LADDER:
+    # فقط برای یوتیوب از نردبان استفاده کن
+    is_youtube = platform == "youtube" or "youtube" in url.lower()
+    ladder = _YT_FB_LADDER if is_youtube else [{}]
+    for rung in ladder:
         opts = dict(base_opts)
         ea = dict(opts.get("extractor_args") or {})
         pc = rung.get("player_client")
@@ -1168,7 +1172,17 @@ def find_downloaded_file(info: Dict[str, Any], prefer_ext: Optional[str] = None)
             id_hits = [f for f in files if vid_id in f.name]
             if id_hits:
                 return id_hits[0]
-            return None
+            # اگر با prefer_ext فیلتر شده و فایلی پیدا نشد، بدون فیلتر پسوند جستجو کن
+            if prefer_ext:
+                files_all_ext = sorted(
+                    (f for f in DOWNLOAD_DIR.glob("*") if f.is_file()),
+                    key=lambda x: x.stat().st_mtime,
+                    reverse=True,
+                )
+                id_hits_all = [f for f in files_all_ext if vid_id in f.name]
+                if id_hits_all:
+                    return id_hits_all[0]
+            # ادامه به fallback بدون id
         # fallback بدون id: جدیدترین فایل (فقط اگر کمتر از ۱۵ دقیقه پیش ساخته شده)
         if files and (time.time() - files[0].stat().st_mtime) < 900:
             return files[0]
@@ -2186,7 +2200,7 @@ async def on_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if text and msg.text:
             # اگر در حالت pending دکمه‌ای منتظر انتخاب پلتفرم است
             if ud.get("pending", {}).get("act") == "search":
-                platform = ud["pending"].get("platform")
+                platform = ud["pending"].get("platform") or ("youtube" if yt_enabled() else "soundcloud")
                 ud.pop("pending", None)
                 await run_music_search(context, msg.chat_id, user, text, platform)
                 return
@@ -2575,7 +2589,7 @@ async def deliver_media(
                 album=clean_title(info.get("album") or ""),
                 year=str(info.get("release_year") or info.get("upload_date") or "")[:4],
                 cover_path=thumb_p)
-        thumb_handle = open(thumb_p, "rb") if thumb_p else None
+        thumb_handle = open(thumb_p, "rb") if thumb_p and thumb_p.exists() else None
         try:
             with path.open("rb") as faud:
                 await context.bot.send_audio(
@@ -2686,7 +2700,7 @@ async def send_music_by_query(
             caption += f"\n🎤 {esc(a_artist)}"
         caption += f"\n📦 {fmt_size(size)} • MP3 {AUDIO_BITRATE}k"
 
-        thumb_handle = open(thumb_path, "rb") if thumb_path else None
+        thumb_handle = open(thumb_path, "rb") if thumb_path and thumb_path.exists() else None
         try:
             with audio_path.open("rb") as fa:
                 await context.bot.send_audio(
@@ -2983,7 +2997,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data == "qry:sc" or data == "qry:yt":
         platform = "soundcloud" if data == "qry:sc" else "youtube"
         query = (context.user_data or {}).get("pending", {}).get("query") or ""
-        chat_id = user.id
+        chat_id = q.message.chat_id if isinstance(q.message, Message) else user.id
         if not query:
             try:
                 await q.answer(L(user.id, "search_empty"), show_alert=True)
@@ -3612,7 +3626,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, dat
 
     if data.startswith("adm:rmc:"):
         try:
-            ref = base64.b64decode(data.split(":", 2)[2]).decode("utf-8")
+            token = data.split(":", 2)[2]
+            # Add padding if necessary for urlsafe_b64decode
+            padding = 4 - (len(token) % 4) if len(token) % 4 else 0
+            ref = base64.urlsafe_b64decode(token + "=" * padding).decode("utf-8")
         except Exception:
             ref = ""
         if ref:
@@ -3718,7 +3735,7 @@ async def render_channels(q) -> None:
         txt = "\n".join(lines) + "\n\n🗑 برای حذف روی دکمه‌ی کانال بزن."
     rows: List[List[InlineKeyboardButton]] = []
     for ch in chans:
-        token = base64.b64encode(ch.encode("utf-8")).decode("ascii")[:44]
+        token = base64.urlsafe_b64encode(ch.encode("utf-8")).decode("ascii").rstrip("=")
         rows.append([InlineKeyboardButton(f"🗑 {ch}", callback_data=f"adm:rmc:{token}")])
     rows.append([InlineKeyboardButton("➕ افزودن کانال", callback_data="adm:addc")])
     rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="adm:panel")])
@@ -3997,9 +4014,9 @@ async def janitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
     except OSError:
         pass
-    # پاکسازی تاریخچه‌های قدیمی‌تر از ۷ روز
+    # پاکسازی تاریخچه‌های قدیمی‌تر از HISTORY_KEEP_DAYS روز
     try:
-        cutoff_iso = datetime.fromtimestamp(cutoff).isoformat(timespec="seconds")
+        cutoff_iso = (datetime.now() - timedelta(days=HISTORY_KEEP_DAYS)).isoformat(timespec="seconds")
         db_exec("DELETE FROM history WHERE ts < ?", (cutoff_iso,))
     except Exception:
         pass
