@@ -3011,8 +3011,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             pass
         return
 
-    simple_heads = ("s:", "sc:", "v:", "q:", "ly:", "pv:", "rg:", "cf:", "f:", "pl:", "rh:",
-                    "scs:", "yt:", "pg:", "alt:")
+    simple_heads = ("s:", "scs:", "sc:", "v:", "q:", "ly:", "pv:", "rg:", "cf:", "f:", "pl:", "rh:",
+                    "yt:", "pg:", "alt:")
     matched = next((h for h in simple_heads if data.startswith(h)), None)
     if matched:
         tok = data[len(matched):]
