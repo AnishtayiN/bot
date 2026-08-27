@@ -2186,7 +2186,7 @@ async def on_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if text and msg.text:
             # اگر در حالت pending دکمه‌ای منتظر انتخاب پلتفرم است
             if ud.get("pending", {}).get("act") == "search":
-                platform = ud["pending"].get("platform")
+                platform = ud["pending"].get("platform") or ("youtube" if yt_enabled() else "soundcloud")
                 ud.pop("pending", None)
                 await run_music_search(context, msg.chat_id, user, text, platform)
                 return
@@ -2983,7 +2983,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data == "qry:sc" or data == "qry:yt":
         platform = "soundcloud" if data == "qry:sc" else "youtube"
         query = (context.user_data or {}).get("pending", {}).get("query") or ""
-        chat_id = user.id
+        chat_id = q.message.chat_id if isinstance(q.message, Message) and hasattr(q.message, "chat_id") else user.id
         if not query:
             try:
                 await q.answer(L(user.id, "search_empty"), show_alert=True)
