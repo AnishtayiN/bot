@@ -1,48 +1,58 @@
 # ============================================================
 #  ربات دانلود ویدیو/موزیک — ایمیج سبک برای Railway / هر سرور داکری
-#  ffmpeg داخل ایمیج نصب می‌شود (هم ffmpeg هم ffprobe)
+#  ffmpeg به‌صورت static نصب می‌شود تا نصب بسته‌ی Debian صدها مگابایت
+#  dependency (و خطای کمبود فضای /var/cache/apt/archives) ایجاد نکند.
 # ============================================================
 FROM python:3.12-slim
 
-# این خط فقط برای شکستن کش بیلد است تا هر بار از نو ساخته شود و خطای واقعی
-# بیلدِ bgutil (که قبلاً silent شکست می‌خورد) در لاگ بیاید.
+# برای اینکه Railway در صورت نیاز لایه‌ی قبلی را دوباره استفاده نکند.
 ARG CACHEBUST=1
+ARG POT_VERSION=1.3.2
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    DENO_NO_PROMPT=1 \
+    DENO_NO_UPDATE_CHECK=1
 
-# ffmpeg: تبدیل صدا/برش | Deno: JS-runtime yt-dlp | git: کلون bgutil
-# (node/npm بعداً جداگانه از NodeSource ورژن ۲۰ نصب می‌شود — debian 12 ورژن ۱۸ دارد که برای bgutil ۲۰۲۶ کافی نیست)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg \
+# ffmpeg/ffprobe از یک build استاتیک می‌آیند؛ بسته‌ی Debianِ ffmpeg روی
+# Python slim فعلی حدود ۵۷۶MB dependency می‌کشد و Railway ممکن است قبل از
+# نصب، در /var/cache/apt/archives با خطای کمبود فضا متوقف شود.
+# Deno برای yt-dlp و provider توکن، و xz/unzip فقط برای باز کردن آرشیوها هستند.
+ARG FFMPEG_URL=https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         unzip \
-        git \
+        xz-utils \
+    && curl -fsSL "$FFMPEG_URL" -o /tmp/ffmpeg.tar.xz \
+    && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp \
+    && install -m 0755 /tmp/ffmpeg-*/bin/ffmpeg /usr/local/bin/ffmpeg \
+    && install -m 0755 /tmp/ffmpeg-*/bin/ffprobe /usr/local/bin/ffprobe \
     && curl -fsSL -o /tmp/deno.zip \
         https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip \
     && unzip -q /tmp/deno.zip -d /usr/local/bin \
     && chmod +x /usr/local/bin/deno \
-    && rm -rf /tmp/deno.zip /var/lib/apt/lists/* \
-    && deno --version
+    && ffmpeg -version | head -1 \
+    && deno --version \
+    && rm -rf /tmp/ffmpeg-* /tmp/ffmpeg.tar.xz /tmp/deno.zip \
+        /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# Node.js 20 (bgutil به آن نیاز دارد؛ debian 12 فقط 18 دارد)
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && node --version && npm --version
-
-# سرور PO-Token (bgutil) با Deno — نسخه‌ی ۲۰۲۶ دیگر npm script «build» ندارد؛
-# سرورش با deno اجرا می‌شود (deno را قبلاً در مرحله‌ی بالا نصب کردیم).
-# --omit=dev فقط دپندنسی‌های تولید را نصب می‌کند؛ سپس deno cache پکیج‌های TS را.
-RUN git clone --depth=1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /opt/pot \
+# سرور PO-Token (bgutil) با Deno — نسخه را با requirements.txt هماهنگ نگه می‌داریم.
+# خود Deno می‌تواند dependencyهای npm را نصب کند؛ بنابراین Node/npm و git
+# را وارد image نمی‌کنیم و حجم/فضای build پایین می‌ماند.
+# --allow-scripts برای نصب native dependency مربوط به canvas لازم است.
+RUN mkdir -p /opt /tmp/pot-src \
+    && curl -fsSL \
+        "https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/refs/tags/${POT_VERSION}.tar.gz" \
+        | tar -xz -C /tmp/pot-src \
+    && mv "/tmp/pot-src/bgutil-ytdlp-pot-provider-${POT_VERSION}" /opt/pot \
     && cd /opt/pot/server \
-    && npm install --no-audit --no-fund --omit=dev --legacy-peer-deps \
+    && deno install --allow-scripts=npm:canvas --frozen \
     && deno cache --frozen src/main.ts \
-    || (echo "===== POT-BUILD-FAILED =====" \
-        && echo "deno: $(deno --version 2>/dev/null | head -1)" \
-        && ls -la /opt/pot/server 2>/dev/null)
+    && rm -rf /tmp/pot-src
 
 WORKDIR /app
 
