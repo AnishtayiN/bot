@@ -3,6 +3,10 @@
 .env
 *.novi.txt
 
+# محیط مجازی/کش تست
+.venv/
+__pycache__/
+
 # داده‌های زمان اجرا
 bot.db*
 downloads/

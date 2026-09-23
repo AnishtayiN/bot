@@ -60,6 +60,19 @@ base64 -w0 cookies.txt
 python bot.py
 ```
 
+## ۵. اجرا روی پلتفرم (VibeNest / Railway / Docker)
+
+پلتفرم خودش متغیر `PORT` را ست می‌کند؛ ربات روی همان پورت یک وب‌سرور وضعیت بالا
+می‌آورد. برای دیدن وضعیت:
+
+```
+https://<دامنه‌ی سرویس>/health
+```
+
+- حداقل متغیرها: `BOT_TOKEN` و `ADMIN_IDS`
+- اگر متغیری کم باشد، به‌جای ۴۰۴ همان آدرس توضیح می‌دهد چه چیزی کم است.
+- راهنمای کامل: [VIBENEST.md](VIBENEST.md) — تست سریع: `python tests/smoke_http.py`
+
 ---
 
 ## 🐳 اجرا با Docker

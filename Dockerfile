@@ -27,13 +27,16 @@ ARG DENO_URL=https://github.com/denoland/deno/releases/latest/download/deno-x86_
 
 # DENO_DIR روی مسیر ثابتی می‌ماند تا کش ماژول‌ها هم در build و هم در runtime
 # یک‌جا باشد و به /root وابسته نباشد.
+# MALLOC_ARENA_MAX تورم حافظه‌ی glibc را روی کانتینرهای کم‌RAM کم می‌کند
+# (پلن‌های رایگان پلتفرم‌ها معمولاً ۲۵۶MB رم دارند).
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     DENO_NO_PROMPT=1 \
     DENO_NO_UPDATE_CHECK=1 \
-    DENO_DIR=/opt/deno
+    DENO_DIR=/opt/deno \
+    MALLOC_ARENA_MAX=2
 
 # ffmpeg/ffprobe از build استاتیک BtbN می‌آیند (بسته‌ی Debianِ ffmpeg روی
 # python:slim حدود ۵۷۶MB dependency می‌کشد). Deno هم برای yt-dlp-ejs و
@@ -59,10 +62,16 @@ RUN pip install -r requirements.txt
 COPY bot.py .env.example README.md start.sh ./
 RUN chmod +x start.sh
 
-# مسیر داده‌ها: در Railway یک Volume روی همین /data مونت کن
-# تا دیتابیس (bot.db) بعد از هر ری‌دیپلوی از دست نرود.
+# مسیر داده‌ها: اگر Volume روی /data مونت کنی، دیتابیس (bot.db) بعد از
+# ری‌دیپلوی می‌ماند. اگر قابل نوشتن نباشد، bot.py خودش به ./data برمی‌گردد.
 ENV DB_PATH=/data/bot.db \
     DOWNLOAD_DIR=/data/downloads
 RUN mkdir -p /data/downloads
 
+# نکته‌ی مهم برای پلتفرم‌های PaaS (Railway / VibeNest / Render / Fly …):
+#   • پلتفرم متغیر PORT را ست می‌کند؛ bot.py همیشه اول از همه یک وب‌سرور
+#     وضعیت روی 0.0.0.0:PORT بالا می‌آورد و مسیرهای / و /health و /healthz
+#     را ۲۰۰ می‌کند (در غیر این صورت Healthcheck شکست می‌خورد و دامنه 404 می‌دهد).
+#   • متغیرهای لازم: BOT_TOKEN و ADMIN_IDS (و اختیاری: FORCE_CHANNELS، LOG_CHANNEL،
+#     COOKIES_B64، WEBHOOK_URL، PROXY_URL …) — با جزئیات در README/VIBENEST.md.
 CMD ["/bin/sh", "/app/start.sh"]

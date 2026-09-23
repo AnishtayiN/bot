@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import html
 import json
 import logging
@@ -38,13 +39,16 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import sqlite3
 import threading
 import time
 import traceback
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import httpx
 import yt_dlp
@@ -63,7 +67,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
+from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -72,6 +76,7 @@ from telegram.ext import (
     ContextTypes,
     InlineQueryHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -101,7 +106,30 @@ def _load_env_file(path: str = ".env") -> None:
 
 _load_env_file()
 
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "PUT-YOUR-TOKEN-HERE")
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """خواندن متغیر بولین («1/true/yes/on» = روشن)."""
+    raw = (os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on", "y", "روشن")
+
+
+def _clean_token(raw: str) -> str:
+    """تمیزکاری توکن: کاربر ممکن است کل لینک api.telegram.org/bot<TOKEN>/... را کپی کند."""
+    tok = (raw or "").strip().strip('"').strip("'").strip()
+    if not tok:
+        return tok
+    tok = re.sub(r"^https?://", "", tok, flags=re.I)
+    tok = re.sub(r"^api\.telegram\.org/", "", tok, flags=re.I)
+    tok = re.sub(r"^bot", "", tok, flags=re.I)
+    tok = tok.split("/")[0].strip()
+    return tok
+
+
+BOT_TOKEN: str = _clean_token(os.getenv("BOT_TOKEN", "PUT-YOUR-TOKEN-HERE"))
+
+TOKEN_LOOKS_VALID: bool = bool(re.fullmatch(r"\d{5,}:[A-Za-z0-9_-]{30,}", BOT_TOKEN or ""))
 
 ADMIN_IDS: List[int] = [
     int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.strip().lstrip("-").isdigit()
@@ -160,6 +188,70 @@ PLIST_MAX_ITEMS: int = int(os.getenv("PLIST_MAX_ITEMS", "25"))   # حداکثر 
 UPLOAD_TIMEOUT: int = 900   # تایم‌اوت آپلود فایل حجیم به تلگرام
 MB: int = 1024 * 1024
 PROCESS_START: float = time.time()
+
+# =====================================================================
+# 🌐 تنظیمات پلتفرم (Railway / VibeNest / Render / Fly / داکر / VPS)
+# =====================================================================
+# پلتفرم‌های PaaS یک پورت را از طریق متغیر PORT اعلام می‌کنند و Healthcheck
+# روی همان پورت می‌زنند؛ اگر پورت ما گوش ندهد، سرویس «Unreachable» علامت
+# می‌خورد، کانتینر بالا نمی‌آید و دامنه خطای 404 می‌دهد. پس همیشه یک وب‌سرور
+# وضعیت روی PORT بالا می‌آید و مسیرهای / و /health و /healthz را پاسخ می‌دهد.
+
+WEB_HOST: str = os.getenv("WEB_HOST", "0.0.0.0").strip() or "0.0.0.0"
+
+
+def _parse_port(raw: str) -> Optional[int]:
+    try:
+        port = int((raw or "").strip())
+    except (TypeError, ValueError):
+        return None
+    return port if 0 < port < 65536 else None
+
+
+PLATFORM_PORT: Optional[int] = _parse_port(os.getenv("PORT", ""))
+# پورت‌های جایگزین فقط وقتی PORT توسط پلتفرم ست نشده باشد باز می‌شوند
+FALLBACK_PORTS: List[int] = [
+    p for p in (_parse_port(x) for x in os.getenv("WEB_FALLBACK_PORTS", "3000 8080 8000 5000 80").split())
+    if p
+]
+IN_CONTAINER: bool = Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()
+
+# حالت وب‌هوک (اختیاری): اگر آدرس عمومی ربات را بدهی، به‌جای getUpdates
+# تلگرام خودش آپدیت‌ها را به همین آدرس POST می‌کند — مناسب پلتفرم‌هایی که
+# خروجی شبکه‌شان محدود است. مثال: WEBHOOK_URL=https://bot.vibenest.net
+WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
+WEBHOOK_PATH: str = "/" + os.getenv("WEBHOOK_PATH", "telegram").strip().strip("/")
+WEBHOOK_SECRET: str = re.sub(r"[^A-Za-z0-9_-]", "", os.getenv("WEBHOOK_SECRET", "").strip())
+if WEBHOOK_URL and not WEBHOOK_SECRET:
+    WEBHOOK_SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:32]
+
+# اگر روی توکن یک وب‌هوکِ قدیمی ست باشد، حالت polling با خطای Conflict کار
+# نمی‌کند؛ این گزینه خودکار پاکش می‌کند (وقتی خودمان وب‌هوک نداریم).
+AUTO_CLEAR_WEBHOOK: bool = _env_bool("AUTO_CLEAR_WEBHOOK", True)
+
+# آدرس جایگزین API تلگرام (سرور Bot API محلی یا پروکسی معکوس)
+TELEGRAM_API_BASE: str = os.getenv("TELEGRAM_API_BASE", "").strip().rstrip("/")
+# پروکسی برای ترافیک تلگرام (و yt-dlp چون httpx/urllib از همین متغیرها می‌خوانند)
+PROXY_URL: str = (os.getenv("PROXY_URL") or os.getenv("HTTPS_PROXY") or os.getenv("ALL_PROXY") or "").strip()
+# فاصله‌ی تلاش مجدد وقتی راه‌اندازی ربات (اتصال به تلگرام) شکست بخورد
+STARTUP_RETRY_SEC: int = int(os.getenv("STARTUP_RETRY_SEC", "20"))
+# بعد از توقف تمیز (SIGTERM) چند ثانیه صفحه‌ی وضعیت بالا بماند و بعد خارج شویم
+STOP_LINGER_SEC: int = int(os.getenv("STOP_LINGER_SEC", "60"))
+
+# وضعیت زنده‌ی ربات — صفحه‌ی /health همین را برمی‌گرداند
+RUNTIME: Dict[str, Any] = {
+    "mode": "starting",          # starting | polling | webhook | stopped | config_error | retrying
+    "ports": [],
+    "bot_username": None,
+    "telegram": "unknown",       # unknown | ok | unreachable | conflict | error
+    "telegram_error": None,
+    "webhook_url": WEBHOOK_URL or None,
+    "pending_updates": None,
+    "updates_seen": 0,
+    "last_update_ts": None,
+    "config_problems": [],
+    "notes": [],
+}
 
 # =====================================================================
 # 🔤 تشخیص پلتفرم
@@ -4099,19 +4191,478 @@ async def janitor(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # =====================================================================
-# ❗️ هندلر خطا
+# ❗️ هندلر خطا و پایش وضعیت
 # =====================================================================
+
+_ADMIN_ALERT_TS: Dict[str, float] = {}
+
+
+async def _alert_admins_once(bot: Any, key: str, text: str, every: int = 900) -> None:
+    """هشدار مهم را حداکثر هر «every» ثانیه یک‌بار برای ادمین‌ها می‌فرستد."""
+    now = time.time()
+    if now - _ADMIN_ALERT_TS.get(key, 0.0) < every:
+        return
+    _ADMIN_ALERT_TS[key] = now
+    for aid in ADMIN_IDS:
+        try:
+            await bot.send_message(aid, text, parse_mode=ParseMode.HTML)
+        except TelegramError:
+            pass
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     exc = context.error
     if isinstance(exc, Exception):
         log_exc(exc, "dispatcher")
+
+    # --- تشخیص سه دلیل اصلی «کار نکردن ربات» ---
+    if isinstance(exc, Conflict):
+        RUNTIME["telegram"] = "conflict"
+        RUNTIME["telegram_error"] = "Conflict: نسخه‌ی دیگری از همین ربات با همین توکن روشن است"
+        log.error("❌ Conflict — دو نسخه از ربات با یک BOT_TOKEN هم‌زمان اجرا می‌شوند. "
+                  "یکی از دیپلوی‌ها (Railway/VPS/لوکال یا همین سرویس در دو ریپلیکا) را خاموش کن؛ "
+                  "در غیر این صورت پیام‌ها بین دو نسخه تقسیم می‌شوند و ربات ناقص جواب می‌دهد.")
+        await _alert_admins_once(
+            context.bot,
+            "conflict",
+            "⚠️ <b>دو نسخه از ربات هم‌زمان روشن است!</b>\n"
+            "همین توکن روی سرور دیگری هم اجرا می‌شود، پس بعضی پیام‌ها به این نسخه نمی‌رسد.\n"
+            "دیپلوی قدیمی را خاموش کن.",
+        )
+    elif isinstance(exc, (NetworkError, TimedOut)):
+        RUNTIME["telegram"] = "unreachable"
+        RUNTIME["telegram_error"] = f"{type(exc).__name__}: {exc}"
+        log.error("❌ ارتباط با سرور تلگرام قطع شد (%s).\n"
+                  "   ↳ اگر سرور در ایران است، برای تلگرام به پروکسی نیاز داری: PROXY_URL=...\n"
+                  "   ↳ وضعیت لحظه‌ای: مسیر /health همین سرویس.", type(exc).__name__)
+    elif isinstance(exc, Forbidden):
+        RUNTIME["telegram_error"] = f"Forbidden: {exc}"
+
     if isinstance(update, Update) and update.effective_message:
         try:
             await update.effective_message.reply_text(ERR_GENERIC_TXT)
         except TelegramError:
             pass
+
+
+async def track_update(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """هر آپدیت دریافتی را ثبت می‌کند تا در /health ببینیم ربات واقعاً زنده است یا نه."""
+    if isinstance(update, Update):
+        RUNTIME["updates_seen"] = int(RUNTIME.get("updates_seen") or 0) + 1
+        RUNTIME["last_update_ts"] = time.time()
+        if RUNTIME.get("telegram") in ("unknown", "unreachable"):
+            RUNTIME["telegram"] = "ok"
+            RUNTIME["telegram_error"] = None
+
+
+# =====================================================================
+# 🌐 وب‌سرور وضعیت (Healthcheck) + دریافت آپدیت در حالت وب‌هوک
+# =====================================================================
+# چرا این بخش مهم است؟
+#   پلتفرم‌هایی مثل VibeNest/Railway یک پورت را با متغیر PORT اعلام می‌کنند و
+#   Healthcheck را روی همان پورت می‌زنند. اگر هیچ سرویسی روی آن پورت گوش ندهد،
+#   وضعیت سرویس «Unreachable» می‌شود، مسیر/دامنه بالا نمی‌آید و آدرس سرویس 404
+#   می‌دهد — حتی اگر ربات در پس‌زمینه سالم باشد. پس این وب‌سرور **همیشه و در
+#   اولین فرصت** (قبل از خطای تنظیمات و قبل از اتصال به تلگرام) بالا می‌آید و
+#   علاوه بر Healthcheck، یک گزارش خوانا از وضعیت ربات نشان می‌دهد.
+
+_APP_REF: Dict[str, Any] = {"app": None, "loop": None}
+_WEB_SERVERS: List[Any] = []
+_HEALTH_PATHS: Tuple[str, ...] = ("/", "/health", "/healthz", "/status", "/ping", "/ready")
+_MAX_BODY_BYTES: int = 4 * MB
+
+
+def _mem_info() -> Dict[str, Any]:
+    """مصرف حافظه + سقف کانتینر (برای تشخیص قتل توسط OOM Killer)."""
+    info: Dict[str, Any] = {}
+    try:
+        with open("/proc/self/statm", "r", encoding="ascii") as fh:
+            info["rss_mb"] = round(int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / MB, 1)
+    except Exception:
+        try:
+            import resource  # noqa: PLC0415
+
+            info["rss_mb"] = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
+        except Exception:
+            pass
+    for cg in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            raw = Path(cg).read_text(encoding="ascii").strip()
+            if raw and raw != "max" and int(raw) < 10 ** 15:
+                info["limit_mb"] = round(int(raw) / MB, 1)
+                break
+        except Exception:
+            continue
+    if info.get("rss_mb") and info.get("limit_mb") and info["rss_mb"] > info["limit_mb"] * 0.85:
+        info["warning"] = ("مصرف حافظه نزدیک سقف کانتینر است — پلتفرم ممکن است پروسه را kill کند؛ "
+                           "پلن با RAM بیشتر یا MAX_CONCURRENT_DL کمتر را امتحان کن.")
+    return info
+
+
+def _status_payload() -> Dict[str, Any]:
+    """گزارش JSON وضعیت — همان چیزی که در مرورگر روی دامنه‌ی سرویس دیده می‌شود."""
+    problems = list(RUNTIME.get("config_problems") or [])
+    payload: Dict[str, Any] = {
+        "status": RUNTIME.get("mode"),
+        "service": "music-video-bot",
+        "ok": (not problems) and RUNTIME.get("telegram") in ("ok", "unknown", "conflict"),
+        "uptime_sec": int(time.time() - PROCESS_START),
+        "mode": RUNTIME.get("mode"),
+        "ports": RUNTIME.get("ports") or [],
+        "bot": ("@" + RUNTIME["bot_username"]) if RUNTIME.get("bot_username") else None,
+        "telegram": {
+            "api": RUNTIME.get("telegram"),
+            "api_base": TELEGRAM_API_BASE or "https://api.telegram.org",
+            "using_proxy": bool(PROXY_URL),
+            "webhook_url": RUNTIME.get("webhook_url"),
+            "pending_updates": RUNTIME.get("pending_updates"),
+            "updates_seen": RUNTIME.get("updates_seen"),
+            "last_update_ago_sec": (
+                round(time.time() - RUNTIME["last_update_ts"]) if RUNTIME.get("last_update_ts") else None
+            ),
+            "last_error": RUNTIME.get("telegram_error"),
+        },
+        "memory": _mem_info(),
+        "yt_dlp": YTDLP_VERSION,
+        "ffmpeg": shutil.which("ffmpeg"),
+        "download_dir": str(DOWNLOAD_DIR),
+        "config_problems": problems,
+    }
+    if problems:
+        payload["hint"] = (
+            "سرویس بالاست ولی ربات راه نیفتاده چون این متغیرها ست نشده‌اند: "
+            + ", ".join(problems)
+            + " — در پنل پلتفرم → Variables اضافه کن و 다시 دیپلوی کن."
+        )
+    elif RUNTIME.get("telegram") == "unreachable":
+        payload["hint"] = ("ربات به سرور تلگرام وصل نمی‌شود (فیلترینگ/شبکه). "
+                           "اگر سرور خارج از ایران است، توکن و اینترنت خروجی سرویس را چک کن؛ "
+                           "اگر سرور ایران است PROXY_URL بگذار.")
+    elif RUNTIME.get("telegram") == "conflict":
+        payload["hint"] = ("دو نسخه از ربات با همین توکن روشن است — یکی را خاموش کن.")
+    return payload
+
+
+class _StatusHandler(BaseHTTPRequestHandler):
+    """مسیرهای / , /health , /healthz → وضعیت؛ مسیر WEBHOOK_PATH → دریافت آپدیت."""
+
+    server_version = "musicbot-status/1.0"
+    protocol_version = "HTTP/1.1"
+
+    # ---------- ابزارها ----------
+    def _json(self, code: int, payload: Dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _path(self) -> str:
+        return urlsplit(self.path).path.rstrip("/") or "/"
+
+    def _error(self, code: int, payload: Dict[str, Any]) -> None:
+        """پاسخ خطا + بستن اتصال (تا بدنه‌ی مصرف‌نشده، درخواست بعدی را خراب نکند)."""
+        self.close_connection = True
+        self._json(code, payload)
+
+    def _read_body(self) -> bytes:
+        """بدنه‌ی درخواست را کامل می‌خواند — بدون این کار، keep-alive خراب می‌شود."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            return b""
+        if length > _MAX_BODY_BYTES:
+            return b""
+        return self.rfile.read(length)
+
+    # ---------- GET / HEAD ----------
+    def do_GET(self) -> None:  # noqa: N802
+        path = self._path()
+        if path in _HEALTH_PATHS:
+            self._json(200, _status_payload())
+        elif path == WEBHOOK_PATH:
+            self._json(200, {"ok": True, "webhook": "ready" if WEBHOOK_URL else "disabled",
+                             "mode": RUNTIME.get("mode"),
+                             "note": ("تلگرام آپدیت‌ها را با POST به همین مسیر می‌فرستد."
+                                      if WEBHOOK_URL else
+                                      "حالت وب‌هوک خاموش است (WEBHOOK_URL ست نشده)؛ ربات با polling کار می‌کند.")})
+        else:
+            self._json(404, {"ok": False, "error": "not found",
+                             "paths": list(_HEALTH_PATHS) + [WEBHOOK_PATH]})
+
+    do_HEAD = do_GET
+
+    # ---------- POST (وب‌هوک تلگرام) ----------
+    def do_POST(self) -> None:  # noqa: N802
+        path = self._path()
+        body = self._read_body()
+        if path in _HEALTH_PATHS:
+            self._json(200, _status_payload())
+            return
+        if path != WEBHOOK_PATH:
+            self._error(404, {"ok": False, "error": "not found"})
+            return
+        if not WEBHOOK_URL:
+            # حالت polling فعال است؛ مسیر وب‌هوک را عمداً باز نمی‌کنیم
+            self._error(404, {"ok": False, "error": "webhook mode is off (WEBHOOK_URL is not set)"})
+            return
+        if WEBHOOK_SECRET:
+            got = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if not secrets.compare_digest(got, WEBHOOK_SECRET):
+                log.warning("⚠️ درخواست POST با secret_token نادرست روی %s رد شد.", WEBHOOK_PATH)
+                self._error(403, {"ok": False, "error": "bad secret token"})
+                return
+        if not body:
+            self._error(413, {"ok": False, "error": "empty or too large body"})
+            return
+        try:
+            data = json.loads(body.decode("utf-8", "replace"))
+        except Exception as exc:  # noqa: BLE001
+            self._error(400, {"ok": False, "error": f"bad json: {exc}"})
+            return
+
+        app_obj = _APP_REF.get("app")
+        loop = _APP_REF.get("loop")
+        if app_obj is None or loop is None or not loop.is_running():
+            self._error(503, {"ok": False, "error": "bot not ready yet",
+                              "hint": "ربات هنوز به تلگرام وصل نشده؛ /health را ببین."})
+            return
+        try:
+            update = Update.de_json(data, app_obj.bot)
+            if update is None:
+                self._json(200, {"ok": True, "ignored": True})
+                return
+            fut = asyncio.run_coroutine_threadsafe(app_obj.update_queue.put(update), loop)
+            fut.result(timeout=10)
+        except Exception as exc:  # noqa: BLE001
+            log_exc(exc, "webhook-queue")
+            self._error(500, {"ok": False, "error": str(exc)})
+            return
+        self._json(200, {"ok": True})
+
+    def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
+        line = fmt % args
+        if "/health" in line or "/healthz" in line or '"GET / ' in line or '"HEAD / ' in line:
+            log.debug("🌐 %s", line)
+        else:
+            log.info("🌐 %s", line)
+
+
+def _bind_server(port: int) -> bool:
+    try:
+        srv = ThreadingHTTPServer((WEB_HOST, port), _StatusHandler)
+    except OSError as exc:
+        log.warning("⚠️ پورت %s باز نشد (%s)", port, exc)
+        return False
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True, name=f"status-{port}").start()
+    _WEB_SERVERS.append(srv)
+    if port not in RUNTIME["ports"]:
+        RUNTIME["ports"].append(port)
+    return True
+
+
+def _start_web_servers() -> List[int]:
+    """باز کردن پورت پلتفرم روی 0.0.0.0 (اول از همه، قبل از هر کار سنگین)."""
+    if _WEB_SERVERS:
+        return list(RUNTIME["ports"])
+    candidates: List[int] = []
+    if PLATFORM_PORT:
+        candidates.append(PLATFORM_PORT)
+        if _bind_server(PLATFORM_PORT):
+            pass  # فقط پورت اعلام‌شده‌ی پلتفرم کافی است
+        else:
+            candidates += [p for p in FALLBACK_PORTS if p != PLATFORM_PORT]
+            for port in candidates[1:]:
+                if _bind_server(port):
+                    break
+    else:
+        # بدون PORT پلتفرم: داخل کانتینر روی پورت‌های رایج گوش می‌دهیم تا هر
+        # روتری (داخلی یا خارجی) ما را پیدا کند؛ روی اجرای محلی فقط 3000.
+        candidates = list(FALLBACK_PORTS) if IN_CONTAINER else list(FALLBACK_PORTS[:1])
+        for port in candidates:
+            _bind_server(port)
+
+    ports = list(RUNTIME["ports"])
+    if ports:
+        for port in ports:
+            log.info("✅ وب‌سرور وضعیت فعال شد → http://%s:%s/  (مسیرها: / و /health و /healthz)",
+                     WEB_HOST, port)
+        if ports and not PLATFORM_PORT:
+            log.warning("ℹ️ متغیر PORT توسط پلتفرم ست نشده بود؛ روی پورت‌های رایج گوش دادم: %s "
+                        "(اگر اشتباه است، PORT را ست کن یا WEB_FALLBACK_PORTS را عوض کن)", ports)
+        if WEBHOOK_URL:
+            log.info("🔗 حالت وب‌هوک: %s%s  (آدرس عمومی: %s)", WEBHOOK_URL, WEBHOOK_PATH, WEBHOOK_URL)
+        else:
+            log.info("ℹ️ روی دامنه‌ی سرویس، آدرس https://<domain>/health وضعیت کامل ربات را نشان می‌دهد.")
+    else:
+        log.error("❌ هیچ پورتی باز نشد! Healthcheck پلتفرم شکست می‌خورد و دامنه می‌تواند 404 بدهد "
+                  "(WEB_HOST=%s, PORT=%s)", WEB_HOST, PLATFORM_PORT)
+    return ports
+
+
+# =====================================================================
+# 🔎 تست‌های قبل از اجرا (اتصال تلگرام، وب‌هوک قدیمی، تنظیمات)
+# =====================================================================
+
+
+def _proxy_kwargs() -> Dict[str, Any]:
+    if not PROXY_URL:
+        return {}
+    try:
+        httpx.Proxy(PROXY_URL)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("⚠️ PROXY_URL نامعتبر است (%s): %s", PROXY_URL, exc)
+        return {}
+    return {"proxy": PROXY_URL}
+
+
+def _tg_api_sync(method: str, **params: Any) -> Dict[str, Any]:
+    """فراخوانی ساده و همگام API تلگرام (فقط برای تست‌های زمان راه‌اندازی)."""
+    base = TELEGRAM_API_BASE or "https://api.telegram.org"
+    url = f"{base}/bot{BOT_TOKEN}/{method}"
+    kwargs: Dict[str, Any] = {"timeout": httpx.Timeout(25.0, connect=15.0)}
+    kwargs.update(_proxy_kwargs())
+    resp = httpx.post(url, json=params, **kwargs)  # type: ignore[arg-type]
+    try:
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        data = {}
+    if not resp.is_success or not isinstance(data, dict) or not data.get("ok"):
+        detail = (data or {}).get("description") or resp.text[:200]
+        raise RuntimeError(f"HTTP {resp.status_code} — {detail}")
+    return data.get("result") or {}
+
+
+def _preflight_telegram() -> None:
+    """قبل از polling: توکن، اتصال شبکه و وب‌هوکِ قدیمی را چک می‌کند."""
+    log.info("🔎 تست اتصال به سرور تلگرام…")
+    try:
+        me = _tg_api_sync("getMe")
+    except Exception as exc:  # noqa: BLE001
+        RUNTIME["telegram"] = "unreachable"
+        RUNTIME["telegram_error"] = str(exc)
+        log.error("❌ اتصال به تلگرام برقرار نشد: %s", exc)
+        log.error("   ↳ سرور خارج از ایران است؟ توکن و اینترنت خروجی سرویس را چک کن "
+                  "(احتمال خطای توکن یا بلاک شدن دامنه).")
+        log.error("   ↳ سرور در ایران است؟ بدون پروکسی کار نمی‌کند: PROXY_URL=socks5://... را ست کن.")
+        log.error("   ↳ وضعیت لحظه‌ای در مرورگر: https://<domain>/health")
+        return
+
+    RUNTIME["telegram"] = "ok"
+    RUNTIME["telegram_error"] = None
+    RUNTIME["bot_username"] = me.get("username") or str(me.get("id"))
+    log.info("✅ اتصال به تلگرام OK — ربات: @%s (id=%s)", RUNTIME["bot_username"], me.get("id"))
+
+    try:
+        info = _tg_api_sync("getWebhookInfo")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("getWebhookInfo ناموفق بود: %s", exc)
+        return
+    RUNTIME["pending_updates"] = info.get("pending_update_count")
+    old_url = (info.get("url") or "").strip()
+    last_err = (info.get("last_error_message") or "").strip()
+    if old_url:
+        if WEBHOOK_URL:
+            log.info("🔗 وب‌هوک فعلی توکن: %s — خودمان مسیر %s را ثبت می‌کنیم.", old_url, WEBHOOK_PATH)
+        elif AUTO_CLEAR_WEBHOOK:
+            log.warning("🧹 روی توکن وب‌هوک قدیمی ست بود (%s) — پاکش می‌کنم تا polling بدون Conflict کار کند.",
+                        old_url)
+            try:
+                _tg_api_sync("deleteWebhook", drop_pending_updates=False)
+                RUNTIME["notes"].append("stale-webhook-removed")
+            except Exception as exc:  # noqa: BLE001
+                log.error("پاک کردن وب‌هوک قدیمی ناموفق بود: %s", exc)
+        else:
+            log.error("❌ روی توکن یک وب‌هوک ست است (%s) و AUTO_CLEAR_WEBHOOK=0 است؛ "
+                      "در این حالت polling با خطای Conflict کار نمی‌کند.", old_url)
+    if RUNTIME["pending_updates"]:
+        log.info("📬 تعداد آپدیت‌های معلق روی سرور تلگرام: %s", RUNTIME["pending_updates"])
+    if last_err:
+        log.warning("⚠️ آخرین خطای وب‌هوک تلگرام: %s", last_err)
+
+
+def _config_problems() -> List[str]:
+    problems: List[str] = []
+    if not BOT_TOKEN or BOT_TOKEN == "PUT-YOUR-TOKEN-HERE":
+        problems.append("BOT_TOKEN")
+    elif not TOKEN_LOOKS_VALID:
+        log.warning("⚠️ BOT_TOKEN شکل استاندارد (مثل 123456789:AA...) را ندارد؛ "
+                    "اگر ربات به تلگرام وصل نشد، توکن را از @BotFather دوباره کپی کن.")
+    if not ADMIN_IDS:
+        problems.append("ADMIN_IDS")
+    return problems
+
+
+def _print_config_help(problems: List[str], ports: List[int]) -> None:
+    lines = [
+        "",
+        "╔══════════════════════════════════════════════════════════╗",
+        "║   ⚠️  متغیرهای ضروری تنظیم نشده‌اند — Required Variables  ║",
+        "╚══════════════════════════════════════════════════════════╝",
+        "",
+        "در پنل سرویس (VibeNest / Railway / …) → بخش Variables اضافه کن:",
+        "",
+    ]
+    if "BOT_TOKEN" in problems:
+        lines.append("   BOT_TOKEN=123456789:AA...      ← توکن از @BotFather")
+    if "ADMIN_IDS" in problems:
+        lines.append("   ADMIN_IDS=123456789            ← آیدی عددی ادمین (چندتا با کاما)")
+    lines += [
+        "",
+        "اختیاری ولی توصیه‌شده:",
+        "   FORCE_CHANNELS=@yourchannel    ← جوین اجباری",
+        "   LOG_CHANNEL=@yourlog           ← کانال گزارش خطاها",
+        "",
+        "بعد از ذخیره، سرویس را دوباره Deploy کن ✅",
+    ]
+    if ports:
+        lines += [
+            "─" * 58,
+            "ℹ️ پروسه عمداً روشن می‌ماند تا آدرس سرویس به‌جای 404، همین توضیح را نشان دهد:",
+            "   https://<دامنه‌ی سرویس>/health",
+        ]
+    lines.append("─" * 58)
+    print("\n".join(lines), flush=True)
+
+
+def _ensure_writable_dir(path: Path, fallback: Path) -> Path:
+    """روی پلتفرم‌ها ممکن است مسیر Volume قابل نوشتن نباشد (کاربر non-root).
+
+    در آن صورت به یک مسیر محلیِ قابل نوشتن برمی‌گردیم تا ربات به‌جای crash کردن، اجرا شود.
+    """
+    for cand in (path, fallback):
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            probe = cand / ".write-probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            if cand != path:
+                log.warning("⚠️ مسیر %s قابل نوشتن نبود؛ از %s استفاده می‌کنم (داده با ری‌دیپلوی پاک می‌شود).",
+                            path, cand)
+            return cand
+        except Exception as exc:  # noqa: BLE001
+            log.warning("⚠️ مسیر %s قابل نوشتن نیست (%s)", cand, exc)
+    return path
+
+
+def _keep_alive(reason: str, every: int = 900) -> None:
+    """پروسه را زنده نگه می‌دارد تا Healthcheck و صفحه‌ی وضعیت همیشه پاسخ بدهند."""
+    try:
+        while True:
+            time.sleep(every)
+            log.warning("⏳ %s | وضعیت=%s | پورت‌ها=%s | راهنما: /health را در مرورگر باز کن",
+                        reason, RUNTIME.get("mode"), RUNTIME.get("ports"))
+    except (KeyboardInterrupt, SystemExit):  # pragma: no cover
+        return
 
 
 # =====================================================================
@@ -4121,9 +4672,14 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def post_init(app: Application) -> None:
     me = await app.bot.get_me()
+    RUNTIME["bot_username"] = me.username or str(me.id)
+    RUNTIME["telegram"] = "ok"
+    RUNTIME["telegram_error"] = None
     log.info("🤖 Bot @%s started successfully!", me.username)
     log.info("💡 اگر جستجوی اینلاین (@%s نام‌آهنگ) نتیجه نمی‌دهد، در BotFather "
              "دستور /setinline را بزن و «نام آهنگ» را placeholder ست کن.", me.username)
+    if RUNTIME["ports"]:
+        log.info("🩺 Healthcheck فعال: پورت %s — روی دامنه‌ی سرویس https://<domain>/health", RUNTIME["ports"])
     try:
         await app.bot.set_my_commands(
             [
@@ -4144,6 +4700,7 @@ async def post_init(app: Application) -> None:
                 aid,
                 "✅ ربات روشن شد و آماده‌ی کار است! 🎬🎵\n"
                 f"📦 yt-dlp: <code>{YTDLP_VERSION}</code>\n"
+                f"🔁 حالت دریافت پیام: <code>{RUNTIME.get('mode')}</code>\n"
                 + (warn + "\n" if warn else "🟢 پیش‌نیازهای یوتیوب کامل است ✅\n")
                 + f"💡 اینلاین کار نمی‌کند؟ در BotFather دستور /setinline را بزن "
                 f"(مثلاً placeholder: «نام آهنگ»).",
@@ -4153,99 +4710,55 @@ async def post_init(app: Application) -> None:
             pass
 
 
-def _start_health_server() -> None:
-    """وب‌سرور مینیاتوری برای Healthcheck پلتفرم‌ها (Railway و…).
-
-    فقط وقتی متغیر PORT ست شده باشد فعال می‌شود؛ روی / یک JSON وضعیت برمی‌گرداند.
-    """
-    port_s = os.getenv("PORT", "").strip()
-    if not port_s:
+async def _health_ping_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """هر ۱۰ دقیقه: هشدار حافظه + بررسی سلامت وب‌هوک."""
+    mem = _mem_info()
+    if mem.get("rss_mb") and mem.get("limit_mb") and mem["rss_mb"] > mem["limit_mb"] * 0.85:
+        log.warning("⚠️ حافظه: %sMB از %sMB کانتینر — نزدیک سقف! اگر پلتفرم پروسه را kill کند "
+                    "ربات خاموش می‌شود (پلن با RAM بیشتر یا MAX_CONCURRENT_DL کمتر).",
+                    mem["rss_mb"], mem["limit_mb"])
+    if not RUNTIME.get("webhook_url"):
         return
     try:
-        port = int(port_s)
-    except ValueError:
-        log.warning("PORT نامعتبر است: %r — healthcheck غیرفعال ماند", port_s)
+        info = await context.bot.get_webhook_info()
+    except TelegramError as exc:
+        RUNTIME["telegram"] = "unreachable"
+        RUNTIME["telegram_error"] = str(exc)
         return
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802
-            body = (
-                '{"status":"ok","service":"music-video-bot","uptime":'
-                + str(int(time.time() - PROCESS_START)) + "}"
-            ).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *args):  # بی‌صدا
-            pass
-
-    try:
-        srv = HTTPServer(("0.0.0.0", port), Handler)
-        threading.Thread(target=srv.serve_forever, daemon=True, name="healthz").start()
-        log.info("✅ healthcheck روی پورت %s فعال شد (GET /)", port)
-    except OSError as exc:
-        log.warning("health server راه نیفتاد: %s", exc)
-
-
-def _validate_env_or_exit() -> None:
-    """قبل از ران، متغیرهای ضروری را چک می‌کند؛ اگر نباشد با راهنمای دقیق خارج می‌شود.
-
-    این همان «سوال‌پرسیدنِ» Railway است: تا Variables را در پنل نگذاری، دیپلوی
-    fail می‌شود و لاگ دقیقاً می‌گوید چه چیزی باید اضافه شود.
-    """
-    missing: List[str] = []
-    if not BOT_TOKEN or BOT_TOKEN == "PUT-YOUR-TOKEN-HERE":
-        missing.append("BOT_TOKEN")
-    if not ADMIN_IDS:
-        missing.append("ADMIN_IDS")
-
-    if missing:
-        lines = [
-            "",
-            "╔══════════════════════════════════════════════════════════╗",
-            "║   ⚠️  متغیرهای ضروری تنظیم نشده‌اند — Required Variables  ║",
-            "╚══════════════════════════════════════════════════════════╝",
-            "",
-            "در پنل Railway → سرویس بات → تب **Variables** اضافه کن:",
-            "",
-        ]
-        if "BOT_TOKEN" in missing:
-            lines.append("   BOT_TOKEN=123456789:AA...      ← توکن از @BotFather")
-        if "ADMIN_IDS" in missing:
-            lines.append("   ADMIN_IDS=123456789            ← آیدی عددی ادمین (با کاما جدا کن)")
-        lines += [
-            "",
-            "اختیاری ولی توصیه‌شده:",
-            "   FORCE_CHANNELS=@yourchannel    ← جوین اجباری (با اسپیس چندتا)",
-            "   LOG_CHANNEL=@yourlog           ← کانال گزارش خطاها",
-            "",
-            "بعد از ذخیره، Railway خودکار دوباره دیپلوی می‌کند ✅",
-            "─" * 58,
-        ]
-        print("\n".join(lines), flush=True)
-        raise SystemExit(1)
-
-    # هشدارهای غیرفاجعه‌بار
-    if not DEFAULT_FORCE_CHANNELS:
-        log.warning("⚠️ FORCE_CHANNELS خالی است — جوین اجباری فعلاً خاموش است (از پنل ادمین هم قابل افزودن است).")
-    if not LOG_CHANNEL:
-        log.warning("⚠️ LOG_CHANNEL خالی است — خطاها فقط در لاگ سرور ثبت می‌شوند.")
-    if shutil.which("ffmpeg") is None and not os.getenv("RAILWAY_ENVIRONMENT"):
-        log.warning("⚠️ ffmpeg پیدا نشد! شناسایی آهنگ (Shazam) کار نخواهد کرد.")
+    RUNTIME["telegram"] = "ok"
+    RUNTIME["pending_updates"] = info.pending_update_count
+    if (info.url or "").strip() != RUNTIME["webhook_url"]:
+        log.warning("⚠️ وب‌هوک تلگرام با آدرس ما یکی نیست (%s) — دوباره ثبتش می‌کنم.", info.url)
+        asyncio.create_task(_register_webhook_loop(context.bot, str(RUNTIME["webhook_url"]), max_attempts=3))
+    if info.last_error_message:
+        RUNTIME["telegram_error"] = f"webhook: {info.last_error_message}"
+        log.warning("⚠️ تلگرام در تحویل آپدیت به وب‌هوک خطا گرفته: %s", info.last_error_message)
 
 
 def build_app(token: str) -> Application:
     """ساخت و پیکربندی کامل اپلیکیشن (جدا از اجرا — برای تست هم استفاده می‌شود)."""
-    app = (
-        ApplicationBuilder()
-        .token(token)
-        .post_init(post_init)
-        .build()
-    )
+    builder = ApplicationBuilder().token(token).post_init(post_init)
+
+    if TELEGRAM_API_BASE:
+        builder = builder.base_url(TELEGRAM_API_BASE).base_file_url(f"{TELEGRAM_API_BASE}/file/bot")
+    proxy_kwargs = _proxy_kwargs()
+    if proxy_kwargs:
+        from telegram.request import HTTPXRequest
+
+        builder = (
+            builder
+            .request(HTTPXRequest(connect_timeout=20, read_timeout=60, write_timeout=180,
+                                  pool_timeout=20, **proxy_kwargs))
+            .get_updates_request(HTTPXRequest(connect_timeout=20, read_timeout=40,
+                                              write_timeout=20, pool_timeout=20, **proxy_kwargs))
+        )
+        log.info("🌐 پروکسی برای ترافیک تلگرام فعال است: %s", PROXY_URL)
+
+    if WEBHOOK_URL:
+        # در حالت وب‌هوک، خودمان سرور HTTP را داریم؛ Updater لازم نیست.
+        builder = builder.updater(None)
+
+    app = builder.build()
 
     # --- Commands ---
     app.add_handler(CommandHandler("start", cmd_start))
@@ -4264,6 +4777,9 @@ def build_app(token: str) -> Application:
     # --- Free content (links / admin inputs) — فقط پیام‌های جدید، نه ویرایش‌ها ---
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & ~filters.COMMAND, on_content))
 
+    # --- ردیابی آپدیت‌ها برای /health (گروه -1 = قبل از هندلرهای اصلی) ---
+    app.add_handler(TypeHandler(Update, track_update, block=False), group=-1)
+
     # --- Errors ---
     app.add_error_handler(on_error)
 
@@ -4271,16 +4787,130 @@ def build_app(token: str) -> Application:
     if app.job_queue is not None:
         app.job_queue.run_once(janitor, 15)
         app.job_queue.run_repeating(janitor, interval=300)
+        app.job_queue.run_repeating(_health_ping_job, interval=600, first=150)
     else:  # pragma: no cover
         log.warning("⚠️ JobQueue در دسترس نیست! `pip install \"python-telegram-bot[job-queue]\"` را نصب کنید.")
     return app
 
 
+async def _register_webhook_once(bot: Any, url: str) -> bool:
+    try:
+        await bot.set_webhook(
+            url=url,
+            secret_token=WEBHOOK_SECRET or None,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            max_connections=40,
+        )
+    except Exception as exc:  # noqa: BLE001
+        RUNTIME["telegram"] = "unreachable"
+        RUNTIME["telegram_error"] = f"setWebhook: {exc}"
+        log.error("⚠️ ثبت وب‌هوک ناموفق بود: %s", exc)
+        return False
+    RUNTIME["telegram"] = "ok"
+    RUNTIME["telegram_error"] = None
+    RUNTIME["webhook_url"] = url
+    log.info("✅ وب‌هوک روی سرور تلگرام ثبت شد: %s", url)
+    return True
+
+
+async def _register_webhook_loop(bot: Any, url: str, max_attempts: int = 0, delay: int = 30) -> None:
+    """ثبت وب‌هوک با تلاش مجدد (max_attempts=0 یعنی بی‌نهایت)."""
+    attempt = 0
+    while True:
+        attempt += 1
+        if await _register_webhook_once(bot, url):
+            return
+        if max_attempts and attempt >= max_attempts:
+            log.error("❌ ثبت وب‌هوک بعد از %s تلاش ناموفق ماند — صفحه‌ی /health وضعیت را نشان می‌دهد.", attempt)
+            return
+        await asyncio.sleep(delay)
+
+
+def _run_polling(app: Application) -> None:
+    RUNTIME["mode"] = "polling"
+    RUNTIME["webhook_url"] = None
+    log.info("🚀 دریافت پیام‌ها با polling… (drop_pending_updates=True)")
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+        timeout=10,
+        # در قطعی موقت شبکه/تلگرام پروسه نمی‌میرد و خودش دوباره تلاش می‌کند؛
+        # اگر می‌مُرد، دامنه‌ی سرویس هم 404 می‌شد.
+        bootstrap_retries=-1,
+    )
+
+
+async def _webhook_runner(app: Application) -> None:
+    """اجرای ربات در حالت وب‌هوک روی همان وب‌سرور وضعیت."""
+    await app.initialize()
+    if app.post_init is not None:
+        await app.post_init(app)
+    await app.start()
+
+    RUNTIME["mode"] = "webhook"
+    url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
+    _APP_REF["app"] = app
+    _APP_REF["loop"] = asyncio.get_running_loop()
+    log.info("🔗 حالت وب‌هوک فعال است — تلگرام آپدیت‌ها را به %s می‌فرستد.", url)
+    asyncio.create_task(_register_webhook_loop(app.bot, url))
+
+    stop_event = asyncio.Event()
+    try:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop_event.set)
+    except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover
+        pass
+    try:
+        await stop_event.wait()
+    except asyncio.CancelledError:  # pragma: no cover
+        pass
+
+    log.info("⏹ خاموش شدن ربات…")
+    try:
+        await app.stop()
+        if app.post_stop is not None:
+            await app.post_stop(app)
+        await app.shutdown()
+        if app.post_shutdown is not None:
+            await app.post_shutdown(app)
+    except Exception as exc:  # noqa: BLE001
+        log_exc(exc, "webhook-shutdown")
+
+
+def _run_once() -> None:
+    app = build_app(BOT_TOKEN)
+    if WEBHOOK_URL:
+        asyncio.run(_webhook_runner(app))
+    else:
+        _run_polling(app)
+
+
 def main() -> None:
-    # --- چک متغیرهای ضروری (Railway: تا Variables را نگذاری، دیپلوی fail می‌شود) ---
-    _validate_env_or_exit()
+    # 1) FIRST: پورت پلتفرم را باز کن. اگر این کار دیر شود یا انجام نشود،
+    #    Healthcheck شکست می‌خورد و آدرس سرویس (دامنه) 404 می‌دهد.
+    ports = _start_web_servers()
+
+    # 2) متغیرهای ضروری
+    problems = _config_problems()
+    RUNTIME["config_problems"] = problems
+    if problems:
+        RUNTIME["mode"] = "config_error"
+        _print_config_help(problems, ports)
+        if ports:
+            log.error("⛔️ ربات راه نیفتاد، ولی صفحه‌ی وضعیت بالاست و دقیقاً می‌گوید چه متغیری کم است: "
+                      "https://<دامنه‌ی سرویس>/health")
+            _keep_alive("متغیرهای ضروری ست نشده‌اند")
+        raise SystemExit(1)
 
     logging.getLogger(__name__).info("🔧 initializing…")
+
+    # مسیرهای داده: اگر Volume پلتفرم قابل نوشتن نبود، fallback محلی
+    global DOWNLOAD_DIR, DB_PATH
+    DOWNLOAD_DIR = _ensure_writable_dir(DOWNLOAD_DIR, Path("./downloads"))
+    DB_PATH = _ensure_writable_dir(DB_PATH.parent, Path("./data")) / DB_PATH.name
+    log.info("📁 مسیر فایل‌ها: %s | دیتابیس: %s", DOWNLOAD_DIR, DB_PATH)
 
     db_init()
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -4289,9 +4919,6 @@ def main() -> None:
         log.info("🍪 cookies found: %s", COOKIES_FILE.resolve())
     else:
         log.info("🍪 cookies.txt پیدا نشد (اختیاری). برای یوتیوب/اینستاگرام محدودشده لازم است.")
-
-    if not ADMIN_IDS:  # pragma: no cover — بالاتر exit شده
-        log.warning("⚠️ ADMIN_IDS خالی است! پنل مدیریت غیرفعال خواهد بود.")
 
     # --- چک پیش‌نیازهای یوتیوب (نسخه + runtime JS + EJS) ---
     _st = js_runtime_status()
@@ -4302,14 +4929,47 @@ def main() -> None:
                     js_runtime_problem_text().replace("<b>", "").replace("</b>", "")
                     .replace("<code>", "").replace("</code>", ""))
 
+    # --- محیط اجرا ---
     if os.getenv("RAILWAY_ENVIRONMENT"):
         log.info("🚂 Railway detected — env=%s", os.getenv("RAILWAY_ENVIRONMENT"))
+    if PLATFORM_PORT:
+        log.info("📡 پورت پلتفرم (PORT=%s) — حالت دریافت پیام: %s",
+                 PLATFORM_PORT, "webhook" if WEBHOOK_URL else "polling")
+    else:
+        log.warning("ℹ️ متغیر PORT ست نشده است — اگر روی پلتفرم اجرا می‌شوی، پورت را از محیط بگیر "
+                    "(روی پورت‌های رایج گوش دادم: %s)", RUNTIME["ports"])
 
-    _start_health_server()
+    # --- تست اتصال تلگرام + وب‌هوک قدیمی ---
+    _preflight_telegram()
+    mem = _mem_info()
+    if mem:
+        log.info("🧠 حافظه: %s", mem)
 
-    app = build_app(BOT_TOKEN)
-    log.info("🚀 polling…")
-    app.run_polling(drop_pending_updates=True)
+    # --- اجرای ربات با تلاش مجدد (پروسه هرگز نباید با خطا بمیرد) ---
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            _run_once()
+            break
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:  # noqa: BLE001
+            RUNTIME["mode"] = "retrying"
+            RUNTIME["telegram"] = "retrying"
+            RUNTIME["telegram_error"] = f"{type(exc).__name__}: {exc}"
+            log_exc(exc, "run")
+            log.warning("♻️ راه‌اندازی مجدد ربات تا %s ثانیه دیگر (تلاش %s) — "
+                        "صفحه‌ی /health همچنان پاسخ می‌دهد.", STARTUP_RETRY_SEC, attempt)
+            time.sleep(STARTUP_RETRY_SEC)
+
+    RUNTIME["mode"] = "stopped"
+    log.warning("⏹ ربات به‌صورت تمیز متوقف شد (SIGTERM/SIGINT) — معمولاً یعنی پلتفرم در حال "
+                "ری‌دیپلوی است. %s ثانیه صفحه‌ی وضعیت را بالا نگه می‌دارم و بعد خارج می‌شوم.",
+                STOP_LINGER_SEC)
+    for _ in range(max(0, STOP_LINGER_SEC)):
+        time.sleep(1)
+    log.info("👋 خروج از پروسه — پلتفرم باید نسخه‌ی جدید را بالا بیاورد.")
 
 
 if __name__ == "__main__":
