@@ -119,8 +119,8 @@ journalctl -u musicbot -f     # مشاهده لاگ
 فایل‌های آماده: **`Dockerfile`** (پایتون ۳.۱۲ + ffmpeg + ffprobe)، **`railway.json`** (ری‌استارت خودکار، تک‌نمونه) و چکِ هوشمند متغیرها داخل خود بات.
 
 ### مرحله ۱ — ریپو را بسازید
-این ۴ فایل را در یک ریپوی GitHub بگذارید و push کنید:
-`bot.py` · `requirements.txt` · `Dockerfile` · `railway.json` (+ `.env.example` و `README.md` اختیاری)
+این فایل‌ها را در یک ریپوی GitHub بگذارید و push کنید:
+`bot.py` · `requirements.txt` · `Dockerfile` · `railway.json` · `docker/bootstrap.py` (+ `.env.example` و `README.md` اختیاری)
 
 ### مرحله ۲ — پروژه در Railway بسازید
 1. وارد [railway.com](https://railway.com) شوید (با GitHub)
@@ -162,6 +162,15 @@ DEFAULT_LANG=fa
 - 🔌 Healthcheck (اختیاری): Settings → Networking → Generate Domain؛ ربات وقتی `PORT` ست شده باشد روی `/` یک JSON وضعیت برمی‌گرداند — می‌توانید UptimeRobot هم به آن وصل کنید
 - 💰 مصرف پلن Trial/Hobby خیلی پایین است (polling سبک + بدون ترافیک وب)
 - ♻️ هر push جدید به GitHub = دیپلوی خودکار
+- 🧱 **خطای «You don't have enough free space in /var/cache/apt/archives/»؟**
+  `Dockerfile` دیگر هیچ بسته‌ی `apt` نصب نمی‌کند و آرشیوهای ffmpeg/deno را روی
+  دیسک نمی‌ریزد؛ `docker/bootstrap.py` آن‌ها را با کتابخانه‌ی استاندارد پایتون
+  **stream** می‌کند و فقط `ffmpeg`، `ffprobe` و `deno` را بیرون می‌کشد (مصرف
+  دیسک هم در لاگ build چاپ می‌شود). اگر باز هم این خطا را دیدید یعنی کشِ
+  builder در Railway پر شده، نه مشکل کد: سرویس را در یک **environment جدید**
+  دیپلوی کنید یا از پشتیبانی Railway بخواهید کش build را پاک کند.
+  ⚠️ متغیر `NO_CACHE=1` نگذارید — build را از صفر بازسازی می‌کند و فضای
+  بیشتری می‌خواهد.
 
 ---
 

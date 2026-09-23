@@ -1,58 +1,55 @@
 # ============================================================
 #  ربات دانلود ویدیو/موزیک — ایمیج سبک برای Railway / هر سرور داکری
-#  ffmpeg به‌صورت static نصب می‌شود تا نصب بسته‌ی Debian صدها مگابایت
-#  dependency (و خطای کمبود فضای /var/cache/apt/archives) ایجاد نکند.
+#
+#  ⚠️ درباره‌ی خطای «E: You don't have enough free space in
+#     /var/cache/apt/archives/»:
+#     کانتینر build در Railway دیسک خیلی محدودی دارد (در لاگ دیپلوی، apt برای
+#     ۱۶٫۶MB هم جا نداشت). نسخه‌ی قبلی این فایل در همان لایه اول apt نصب
+#     می‌کرد و بعد آرشیو ۱۴۹٫۴ مگابایتی ffmpeg را روی دیسک می‌ریخت و کامل
+#     extract می‌کرد (سه باینری استاتیک بزرگ + doc/lib/models) و بعد هم zip
+#     مربوط به Deno (۴۱٫۶MB) را دانلود و unzip می‌کرد؛ یعنی چند صد مگابایت
+#     نوشتنِ موقت، فقط برای رسیدن به سه فایل.
+#
+#     حالا هیچ بسته‌ی apt نصب نمی‌شود (curl/unzip/xz لازم نیست) و هیچ
+#     آرشیوی روی دیسک نوشته نمی‌شود: docker/bootstrap.py با کتابخانه‌ی
+#     استاندارد پایتون آرشیوها را stream می‌کند و فقط ffmpeg و ffprobe و
+#     deno را بیرون می‌کشد. مصرف دیسک هم قبل و بعد از هر مرحله در لاگ
+#     build چاپ می‌شود.
+#
+#  نکته: عمداً ARG CACHEBUST اینجا نیست. اگر هر دیپلوی مقدارش عوض شود،
+#     همه‌ی لایه‌ها از اول ساخته می‌شوند و کش build بی‌دلیل پر می‌شود.
 # ============================================================
 FROM python:3.12-slim
 
-# برای اینکه Railway در صورت نیاز لایه‌ی قبلی را دوباره استفاده نکند.
-ARG CACHEBUST=1
 ARG POT_VERSION=1.3.2
+ARG FFMPEG_URL=https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz
+ARG DENO_URL=https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip
 
+# DENO_DIR روی مسیر ثابتی می‌ماند تا کش ماژول‌ها هم در build و هم در runtime
+# یک‌جا باشد و به /root وابسته نباشد.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     DENO_NO_PROMPT=1 \
-    DENO_NO_UPDATE_CHECK=1
+    DENO_NO_UPDATE_CHECK=1 \
+    DENO_DIR=/opt/deno
 
-# ffmpeg/ffprobe از یک build استاتیک می‌آیند؛ بسته‌ی Debianِ ffmpeg روی
-# Python slim فعلی حدود ۵۷۶MB dependency می‌کشد و Railway ممکن است قبل از
-# نصب، در /var/cache/apt/archives با خطای کمبود فضا متوقف شود.
-# Deno برای yt-dlp و provider توکن، و xz/unzip فقط برای باز کردن آرشیوها هستند.
-ARG FFMPEG_URL=https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl \
-        unzip \
-        xz-utils \
-    && curl -fsSL "$FFMPEG_URL" -o /tmp/ffmpeg.tar.xz \
-    && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp \
-    && install -m 0755 /tmp/ffmpeg-*/bin/ffmpeg /usr/local/bin/ffmpeg \
-    && install -m 0755 /tmp/ffmpeg-*/bin/ffprobe /usr/local/bin/ffprobe \
-    && curl -fsSL -o /tmp/deno.zip \
-        https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip \
-    && unzip -q /tmp/deno.zip -d /usr/local/bin \
-    && chmod +x /usr/local/bin/deno \
-    && ffmpeg -version | head -1 \
-    && deno --version \
-    && rm -rf /tmp/ffmpeg-* /tmp/ffmpeg.tar.xz /tmp/deno.zip \
-        /var/lib/apt/lists/* /var/cache/apt/archives/*
+# ffmpeg/ffprobe از build استاتیک BtbN می‌آیند (بسته‌ی Debianِ ffmpeg روی
+# python:slim حدود ۵۷۶MB dependency می‌کشد). Deno هم برای yt-dlp-ejs و
+# سرویس PO-Token لازم است. هر دو بدون apt نصب می‌شوند.
+COPY docker/bootstrap.py /tmp/bootstrap.py
+RUN python /tmp/bootstrap.py tools \
+        --bin-dir /usr/local/bin \
+        --ffmpeg-url "$FFMPEG_URL" \
+        --deno-url "$DENO_URL"
 
-# سرور PO-Token (bgutil) با Deno — نسخه را با requirements.txt هماهنگ نگه می‌داریم.
-# خود Deno می‌تواند dependencyهای npm را نصب کند؛ بنابراین Node/npm و git
-# را وارد image نمی‌کنیم و حجم/فضای build پایین می‌ماند.
-# --allow-scripts برای نصب native dependency مربوط به canvas لازم است.
-RUN mkdir -p /opt /tmp/pot-src \
-    && curl -fsSL \
-        "https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/refs/tags/${POT_VERSION}.tar.gz" \
-        | tar -xz -C /tmp/pot-src \
-    && mv "/tmp/pot-src/bgutil-ytdlp-pot-provider-${POT_VERSION}" /opt/pot \
-    && cd /opt/pot/server \
-    && deno install --allow-scripts=npm:canvas --frozen \
-    && deno cache --frozen src/main.ts \
-    && rm -rf /tmp/pot-src
+# سرور PO-Token (bgutil) با Deno — نسخه را با requirements.txt هماهنگ نگه
+# دارید. Deno خودش dependencyهای npm را نصب می‌کند؛ بنابراین Node/npm و git
+# وارد ایمیج نمی‌شوند. اگر این مرحله شکست خورد، build نمی‌خوابد: start.sh
+# بدون provider هم ربات را بالا می‌آورد (yt-dlp در حالت graceful).
+RUN python /tmp/bootstrap.py pot --dest /opt/pot --version "$POT_VERSION" \
+    && rm -f /tmp/bootstrap.py
 
 WORKDIR /app
 
